@@ -1,9 +1,15 @@
 // Memory-optimised UNO version.
 // RGB strips only. No RGBW.
-// Strip A: smooth sub-pixel blobs.
-// Strip B: travelling palette/white gradient.
-// Palette advances on each startup using EEPROM:
-// Terracotta -> Forest -> Ocean -> Rainbow -> repeat.
+// Presets advance on each startup using EEPROM:
+//
+// 0 Terracotta flow
+// 1 Forest flow
+// 2 Ocean flow
+// 3 Rainbow flow
+// 4 Terracotta pulse
+// 5 Forest pulse
+// 6 Ocean pulse
+// 7 Rainbow pulse
 
 #include <Adafruit_NeoPixel.h>
 #include <EEPROM.h>
@@ -46,7 +52,10 @@ Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 Adafruit_NeoPixel stripB(LED_COUNT_B, LED_PIN_B, NEO_GRB + NEO_KHZ800);
 
-// ===================== PALETTES =====================
+// ===================== PULSE =====================
+#define PULSE_PERIOD_MS 4200
+
+// ===================== PALETTES / PRESETS =====================
 #define PAL_TERRACOTTA 0
 #define PAL_FOREST     1
 #define PAL_OCEAN      2
@@ -54,7 +63,15 @@ Adafruit_NeoPixel stripB(LED_COUNT_B, LED_PIN_B, NEO_GRB + NEO_KHZ800);
 #define PAL_COUNT      4
 #define PAL_COLORS     4
 
-#define EEPROM_PALETTE_ADDR 0
+#define EFFECT_FLOW    0
+#define EFFECT_PULSE   1
+
+#define PRESET_COUNT   8
+#define EEPROM_PRESET_ADDR 0
+
+uint8_t currentPreset = 0;
+uint8_t currentPalette = PAL_TERRACOTTA;
+uint8_t currentEffect = EFFECT_FLOW;
 
 const uint8_t palettes[PAL_COUNT][PAL_COLORS][3] PROGMEM = {
   { // Terracotta
@@ -83,23 +100,24 @@ const uint8_t palettes[PAL_COUNT][PAL_COLORS][3] PROGMEM = {
   }
 };
 
-uint8_t currentPalette = PAL_TERRACOTTA;
+// ===================== BLOBS =====================
+#define MAX_BLOBS 8
 
-uint8_t getNextPalette() {
-  uint8_t last = EEPROM.read(EEPROM_PALETTE_ADDR);
+struct Blob {
+  int32_t pos;        // fixed-point start position, LED * 256
+  uint16_t lastMs;    // low 16 bits of millis
+  uint16_t spawnMs;   // low 16 bits of millis
+  uint8_t len;
+  uint8_t feather;
+  uint8_t level;
+  uint8_t r, g, b;
+  uint8_t stepMs;
+  uint8_t active;
+};
 
-  // First use / garbage value protection
-  if (last >= PAL_COUNT) {
-    last = PAL_COUNT - 1;
-  }
+Blob blobs[MAX_BLOBS];
 
-  uint8_t next = last + 1;
-  if (next >= PAL_COUNT) next = 0;
-
-  EEPROM.update(EEPROM_PALETTE_ADDR, next);
-  return next;
-}
-
+// ===================== PALETTE / PRESET HELPERS =====================
 void getPaletteColor(uint8_t palette, uint8_t index, uint8_t &r, uint8_t &g, uint8_t &b) {
   palette %= PAL_COUNT;
   index &= 3;
@@ -107,6 +125,39 @@ void getPaletteColor(uint8_t palette, uint8_t index, uint8_t &r, uint8_t &g, uin
   r = pgm_read_byte(&palettes[palette][index][0]);
   g = pgm_read_byte(&palettes[palette][index][1]);
   b = pgm_read_byte(&palettes[palette][index][2]);
+}
+
+void clearBlobs() {
+  for (uint8_t i = 0; i < MAX_BLOBS; i++) {
+    blobs[i].active = 0;
+  }
+}
+
+void setPreset(uint8_t p) {
+  currentPreset = p % PRESET_COUNT;
+
+  if (currentPreset < PAL_COUNT) {
+    currentEffect = EFFECT_FLOW;
+    currentPalette = currentPreset;
+  } else {
+    currentEffect = EFFECT_PULSE;
+    currentPalette = currentPreset - PAL_COUNT;
+  }
+}
+
+uint8_t getNextPreset() {
+  uint8_t last = EEPROM.read(EEPROM_PRESET_ADDR);
+
+  // First use / garbage value protection
+  if (last >= PRESET_COUNT) {
+    last = PRESET_COUNT - 1;
+  }
+
+  uint8_t next = last + 1;
+  if (next >= PRESET_COUNT) next = 0;
+
+  EEPROM.update(EEPROM_PRESET_ADDR, next);
+  return next;
 }
 
 // ===================== HELPERS =====================
@@ -148,27 +199,28 @@ static inline uint8_t featherIntensityFP(int32_t local, uint8_t len, uint8_t fea
   return 255;
 }
 
-// ===================== BLOBS =====================
-#define MAX_BLOBS 8
-
-struct Blob {
-  int32_t pos;        // fixed-point start position, LED * 256
-  uint16_t lastMs;    // low 16 bits of millis
-  uint16_t spawnMs;   // low 16 bits of millis
-  uint8_t len;
-  uint8_t feather;
-  uint8_t level;
-  uint8_t r, g, b;
-  uint8_t stepMs;
-  uint8_t active;
-};
-
-Blob blobs[MAX_BLOBS];
-
 static inline uint16_t now16(uint32_t now) {
   return (uint16_t)now;
 }
 
+// Smooth pulse from 0..255..0
+uint8_t pulseAmount(uint32_t now) {
+  uint16_t phase = now % PULSE_PERIOD_MS;
+  uint16_t half = PULSE_PERIOD_MS / 2;
+
+  uint16_t x;
+  if (phase < half) {
+    x = ((uint32_t)phase * 255UL) / half;
+  } else {
+    x = ((uint32_t)(PULSE_PERIOD_MS - phase) * 255UL) / half;
+  }
+
+  // smoothstep easing: x*x*(3-2x)
+  uint16_t xx = ((uint32_t)x * x) / 255;
+  return (uint8_t)(((uint32_t)xx * (765 - 2 * x)) / 255);
+}
+
+// ===================== FLOW BLOBS =====================
 int8_t allocBlob() {
   for (uint8_t i = 0; i < MAX_BLOBS; i++) {
     if (!blobs[i].active) return i;
@@ -238,9 +290,7 @@ void updateBlobs(uint32_t now) {
   }
 }
 
-// No RGB accumulator arrays.
-// For each pixel, calculate combined colour directly.
-void renderAndPushStripA(uint32_t now) {
+void renderFlowStripA(uint32_t now) {
   uint16_t n = now16(now);
 
   for (uint16_t x = 0; x < LED_COUNT; x++) {
@@ -277,7 +327,6 @@ void renderAndPushStripA(uint32_t now) {
   strip.show();
 }
 
-// ===================== STRIP B =====================
 void updateStripB_Travel(uint32_t now) {
   float t = (float)(now % TRAVEL_PERIOD_MS) / (float)TRAVEL_PERIOD_MS;
   const float cyclesAcrossStrip = 1.0f;
@@ -333,12 +382,47 @@ void updateStripB_Travel(uint32_t now) {
   stripB.show();
 }
 
+// ===================== PULSE EFFECT =====================
+void renderPulseStripA(uint32_t now) {
+  uint8_t p = pulseAmount(now);
+
+  for (uint16_t i = 0; i < LED_COUNT; i++) {
+    uint8_t r, g, b;
+    getPaletteColor(currentPalette, (i / 18) & 3, r, g, b);
+
+    strip.setPixelColor(i, strip.Color(
+      scaleU8(r, p),
+      scaleU8(g, p),
+      scaleU8(b, p)
+    ));
+  }
+
+  strip.show();
+}
+
+void renderPulseStripB(uint32_t now) {
+  uint8_t p = pulseAmount(now);
+
+  for (uint8_t i = 0; i < LED_COUNT_B; i++) {
+    uint8_t r, g, b;
+    getPaletteColor(currentPalette, i & 3, r, g, b);
+
+    stripB.setPixelColor(i,
+      scaleU8(r, p),
+      scaleU8(g, p),
+      scaleU8(b, p)
+    );
+  }
+
+  stripB.show();
+}
+
 // ===================== MAIN =====================
 uint32_t lastSpawnWhite = 0;
 uint32_t lastSpawnColor = 0;
 
 void setup() {
-  currentPalette = getNextPalette();
+  setPreset(getNextPreset());
 
   // Still seed random for colour selection within the active palette.
   randomSeed(analogRead(A5) ^ micros());
@@ -351,32 +435,37 @@ void setup() {
   stripB.setBrightness(BRIGHTNESS_B);
   stripB.show();
 
-  for (uint8_t i = 0; i < MAX_BLOBS; i++) {
-    blobs[i].active = 0;
-  }
+  clearBlobs();
 
   uint32_t now = millis();
   lastSpawnWhite = now;
   lastSpawnColor = now;
 
-  spawnWhiteBlob(now);
-  spawnColorBlob(now);
+  if (currentEffect == EFFECT_FLOW) {
+    spawnWhiteBlob(now);
+    spawnColorBlob(now);
+  }
 }
 
 void loop() {
   uint32_t now = millis();
 
-  if ((uint32_t)(now - lastSpawnWhite) >= WHITE_SPAWN_MS) {
-    lastSpawnWhite = now;
-    spawnWhiteBlob(now);
-  }
+  if (currentEffect == EFFECT_FLOW) {
+    if ((uint32_t)(now - lastSpawnWhite) >= WHITE_SPAWN_MS) {
+      lastSpawnWhite = now;
+      spawnWhiteBlob(now);
+    }
 
-  if ((uint32_t)(now - lastSpawnColor) >= COLOR_SPAWN_MS) {
-    lastSpawnColor = now;
-    spawnColorBlob(now);
-  }
+    if ((uint32_t)(now - lastSpawnColor) >= COLOR_SPAWN_MS) {
+      lastSpawnColor = now;
+      spawnColorBlob(now);
+    }
 
-  updateBlobs(now);
-  renderAndPushStripA(now);
-  updateStripB_Travel(now);
+    updateBlobs(now);
+    renderFlowStripA(now);
+    updateStripB_Travel(now);
+  } else {
+    renderPulseStripA(now);
+    renderPulseStripB(now);
+  }
 }
