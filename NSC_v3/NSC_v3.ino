@@ -6,6 +6,20 @@
 #endif
 
 // ============================================================
+// ===================== USER CONFIG ===========================
+// ============================================================
+
+#define SpeedPC 20
+// 0   = static
+// 25  = slow
+// 50  = normal slow speed
+// 100 = fastest, but now 3x slower than previous version
+
+#define SPEED_DIVIDER 4.0f
+// Increase this to make everything slower.
+// 3.0 = three times slower than before.
+
+// ============================================================
 // ===================== STRIP A CONFIG ========================
 // ============================================================
 
@@ -15,17 +29,13 @@
 
 // ---------------- WHITE BLOB ----------------
 
-#define WHITE_LENGTH_PIXELS              30
-#define WHITE_STEP_SECONDS               0.005f
-#define WHITE_INTENSITY                 255
-#define WHITE_SPAWN_INTERVAL_SECONDS     0.7f
+#define WHITE_LENGTH_PIXELS   30
+#define WHITE_INTENSITY       255
 
 // ---------------- TERRACOTTA BLOB ----------------
 
-#define TERRACOTTA_LENGTH_PIXELS              35
-#define TERRACOTTA_STEP_SECONDS               0.010f
-#define TERRACOTTA_INTENSITY                 255
-#define TERRACOTTA_SPAWN_INTERVAL_SECONDS     0.9f
+#define TERRACOTTA_LENGTH_PIXELS   35
+#define TERRACOTTA_INTENSITY       255
 
 #define TERRACOTTA_RED    210
 #define TERRACOTTA_GREEN   90
@@ -33,14 +43,8 @@
 
 // ---------------- SHAPE / BEHAVIOUR ----------------
 
-#define EDGE_FEATHER_PIXELS   5
+#define EDGE_FEATHER_PIXELS   8
 #define ARRIVAL_FADE_SECONDS  0.35f
-
-//- DO NOT EDIT ANYTHING BELOW THIS PART ----------------------------------------------------------------------------------//
-//------------------------------------------------------------------------------------------------------------------------//
-//------------------------------------------------------------------------------------------------------------------------//
-//------------------------------------------------------------------------------------------------------------------------//
-//------------------------------------------------------------------------------------------------------------------------//
 
 // ============================================================
 // ===================== STRIP B CONFIG ========================
@@ -50,19 +54,72 @@
 #define LED_COUNT_B      5
 #define BRIGHTNESS_B     255
 
-#define TRAVEL_PERIOD_MS 1200
+// ============================================================
+// ========== INTERNAL ORIGINAL SPEED SETTINGS =================
+// ============================================================
+
+#define WHITE_PIXELS_PER_SECOND_BASE        200.0f
+#define TERRACOTTA_PIXELS_PER_SECOND_BASE   100.0f
+
+#define WHITE_SPAWN_INTERVAL_SECONDS_BASE       0.7f
+#define TERRACOTTA_SPAWN_INTERVAL_SECONDS_BASE  0.9f
+
+#define TRAVEL_PERIOD_MS_BASE                   1200
+
+//- DO NOT EDIT ANYTHING BELOW THIS PART ----------------------------------------------------------------------------------//
+//------------------------------------------------------------------------------------------------------------------------//
+//------------------------------------------------------------------------------------------------------------------------//
+//------------------------------------------------------------------------------------------------------------------------//
+//------------------------------------------------------------------------------------------------------------------------//
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-
-// ============================================================
-// ===================== TIME CONVERSION =======================
-// ============================================================
-
-// Convert seconds → milliseconds (used internally with millis())
-#define SECONDS_TO_MS(x) ((uint32_t)((x) * 1000.0f))
-
 Adafruit_NeoPixel stripB(LED_COUNT_B, LED_PIN_B, NEO_GRB + NEO_KHZ800);
+
+// ============================================================
+// ===================== SPEED HELPERS =========================
+// ============================================================
+
+int clampedSpeedPC() {
+  if (SpeedPC < 0) return 0;
+  if (SpeedPC > 100) return 100;
+  return SpeedPC;
+}
+
+float speedScale() {
+  if (clampedSpeedPC() <= 0) return 0.0f;
+
+  // Before:
+  // SpeedPC 50 = original/full speed
+  // SpeedPC 100 = double speed
+  //
+  // Now:
+  // The whole scale is divided by SPEED_DIVIDER.
+  return (clampedSpeedPC() / 50.0f) / SPEED_DIVIDER;
+}
+
+bool animationEnabled() {
+  return clampedSpeedPC() > 0;
+}
+
+uint32_t scaledSecondsToMs(float secondsAtFullSpeed) {
+  float s = speedScale();
+
+  if (s <= 0.0f) {
+    return 0xFFFFFFFFUL;
+  }
+
+  return (uint32_t)((secondsAtFullSpeed * 1000.0f) / s);
+}
+
+uint32_t scaledTravelPeriodMs() {
+  float s = speedScale();
+
+  if (s <= 0.0f) {
+    return 0xFFFFFFFFUL;
+  }
+
+  return (uint32_t)(TRAVEL_PERIOD_MS_BASE / s);
+}
 
 // ============================================================
 // ===================== ACCUMULATORS ==========================
@@ -92,6 +149,13 @@ static inline uint8_t lerpU8(uint8_t a, uint8_t b, float t) {
   return a + (b - a) * t + 0.5f;
 }
 
+static inline uint8_t scaleFloatToU8(uint8_t v, float scale) {
+  if (scale < 0.0f) scale = 0.0f;
+  if (scale > 1.0f) scale = 1.0f;
+
+  return (uint8_t)(v * scale + 0.5f);
+}
+
 void clearAccumulatorsA() {
   for (int i = 0; i < LED_COUNT; i++) {
     accR[i] = accG[i] = accB[i] = accW[i] = 0;
@@ -102,23 +166,25 @@ void clearAccumulatorsA() {
 // ===================== FEATHERING ============================
 // ============================================================
 
-uint8_t featherIntensity(int i, int length, int feather) {
-  if (length <= 1) return 255;
+float featherIntensityFloat(float i, float length, float feather) {
+  if (length <= 1.0f) return 1.0f;
 
-  if (feather * 2 > length) feather = length / 2;
+  if (feather * 2.0f > length) {
+    feather = length * 0.5f;
+  }
 
-  int flatLength = length - 2 * feather;
+  float flatLength = length - 2.0f * feather;
 
   if (i < feather) {
-    return 255 * (i + 1) / feather;
+    return (i + 1.0f) / feather;
   }
 
   if (i >= feather + flatLength) {
-    int t = length - i;
-    return 255 * t / feather;
+    float t = length - i;
+    return t / feather;
   }
 
-  return 255;
+  return 1.0f;
 }
 
 // ============================================================
@@ -128,7 +194,9 @@ uint8_t featherIntensity(int i, int length, int feather) {
 struct Blob {
   bool active;
 
-  int position;
+  float position;
+  float velocityPixelsPerSecond;
+
   int lengthPixels;
   int featherPixels;
 
@@ -137,9 +205,7 @@ struct Blob {
   uint8_t intensity;
   uint8_t r, g, b;
 
-  uint32_t stepIntervalMs;
-  uint32_t lastStepTimeMs;
-
+  uint32_t lastUpdateTimeMs;
   uint32_t spawnTimeMs;
 };
 
@@ -154,56 +220,63 @@ int allocateBlob() {
   for (int i = 0; i < MAX_BLOBS; i++) {
     if (!blobs[i].active) return i;
   }
+
   return -1;
 }
 
-void spawnWhiteBlob(uint32_t now) {
+void spawnWhiteBlob(uint32_t now, float startPosition) {
   int i = allocateBlob();
   if (i < 0) return;
 
   blobs[i] = {
     true,
-    -WHITE_LENGTH_PIXELS,
+    startPosition,
+    WHITE_PIXELS_PER_SECOND_BASE * speedScale(),
     WHITE_LENGTH_PIXELS,
     EDGE_FEATHER_PIXELS,
     true,
     WHITE_INTENSITY,
-    0,0,0,
-    SECONDS_TO_MS(WHITE_STEP_SECONDS),
+    0, 0, 0,
     now,
     now
   };
 }
 
-void spawnTerracottaBlob(uint32_t now) {
+void spawnTerracottaBlob(uint32_t now, float startPosition) {
   int i = allocateBlob();
   if (i < 0) return;
 
   blobs[i] = {
     true,
-    -TERRACOTTA_LENGTH_PIXELS,
+    startPosition,
+    TERRACOTTA_PIXELS_PER_SECOND_BASE * speedScale(),
     TERRACOTTA_LENGTH_PIXELS,
     EDGE_FEATHER_PIXELS,
     false,
     TERRACOTTA_INTENSITY,
     TERRACOTTA_RED, TERRACOTTA_GREEN, TERRACOTTA_BLUE,
-    SECONDS_TO_MS(TERRACOTTA_STEP_SECONDS),
     now,
     now
   };
 }
 
 void updateBlobs(uint32_t now) {
+  if (!animationEnabled()) return;
+
   for (int i = 0; i < MAX_BLOBS; i++) {
     if (!blobs[i].active) continue;
 
-    if (now - blobs[i].lastStepTimeMs >= blobs[i].stepIntervalMs) {
-      blobs[i].lastStepTimeMs = now;
-      blobs[i].position++;
+    float dt = (now - blobs[i].lastUpdateTimeMs) / 1000.0f;
+    blobs[i].lastUpdateTimeMs = now;
 
-      if (blobs[i].position >= LED_COUNT) {
-        blobs[i].active = false;
-      }
+    blobs[i].velocityPixelsPerSecond = blobs[i].isWhite
+      ? WHITE_PIXELS_PER_SECOND_BASE * speedScale()
+      : TERRACOTTA_PIXELS_PER_SECOND_BASE * speedScale();
+
+    blobs[i].position += blobs[i].velocityPixelsPerSecond * dt;
+
+    if (blobs[i].position >= LED_COUNT) {
+      blobs[i].active = false;
     }
   }
 }
@@ -219,21 +292,28 @@ void renderBlobsToAccumulators(uint32_t now) {
     Blob &b = blobs[bi];
 
     uint32_t age = now - b.spawnTimeMs;
+    uint32_t fadeDuration = (uint32_t)(ARRIVAL_FADE_SECONDS * 1000.0f);
 
-    uint32_t fadeDuration = SECONDS_TO_MS(ARRIVAL_FADE_SECONDS);
+    float arrivalFactor = 1.0f;
 
-    uint8_t arrivalFactor = (fadeDuration == 0 || age >= fadeDuration)
-      ? 255
-      : (age * 255UL / fadeDuration);
+    if (fadeDuration > 0 && age < fadeDuration) {
+      arrivalFactor = (float)age / (float)fadeDuration;
+    }
 
-    for (int i = 0; i < b.lengthPixels; i++) {
-      int x = b.position + i;
+    int renderStart = floor(b.position) - 1;
+    int renderEnd = ceil(b.position + b.lengthPixels) + 1;
 
+    for (int x = renderStart; x <= renderEnd; x++) {
       if (x < 0 || x >= LED_COUNT) continue;
 
-      uint8_t featherFactor = featherIntensity(i, b.lengthPixels, b.featherPixels);
-      uint8_t combinedFactor = scaleU8(featherFactor, arrivalFactor);
-      uint8_t brightness = scaleU8(b.intensity, combinedFactor);
+      float local = (float)x - b.position;
+
+      if (local < 0.0f || local >= b.lengthPixels) continue;
+
+      float featherFactor = featherIntensityFloat(local, b.lengthPixels, b.featherPixels);
+
+      float combinedFactor = featherFactor * arrivalFactor;
+      uint8_t brightness = scaleFloatToU8(b.intensity, combinedFactor);
 
       if (b.isWhite) {
         accW[x] = addClampU8(accW[x], brightness);
@@ -248,9 +328,12 @@ void renderBlobsToAccumulators(uint32_t now) {
 
 void pushToStripA() {
   for (int i = 0; i < LED_COUNT; i++) {
-    strip.setPixelColor(i,
-      strip.Color(accR[i], accG[i], accB[i], accW[i]));
+    strip.setPixelColor(
+      i,
+      strip.Color(accR[i], accG[i], accB[i], accW[i])
+    );
   }
+
   strip.show();
 }
 
@@ -259,11 +342,15 @@ void pushToStripA() {
 // ============================================================
 
 void updateStripB_Travel(uint32_t now) {
+  uint32_t period = scaledTravelPeriodMs();
 
-  float t = (float)(now % TRAVEL_PERIOD_MS) / TRAVEL_PERIOD_MS;
+  float t = 0.0f;
+
+  if (animationEnabled()) {
+    t = (float)(now % period) / period;
+  }
 
   for (int i = 0; i < LED_COUNT_B; i++) {
-
     float u = t + (float)i / LED_COUNT_B;
     u = u - floorf(u);
 
@@ -271,20 +358,36 @@ void updateStripB_Travel(uint32_t now) {
     int s = (int)seg;
     float f = seg - s;
 
-    uint8_t r0=0,g0=0,b0=0;
-    uint8_t r1=0,g1=0,b1=0;
+    uint8_t r0 = 0, g0 = 0, b0 = 0;
+    uint8_t r1 = 0, g1 = 0, b1 = 0;
 
     switch (s) {
-      case 0: r1=g1=b1=WHITE_INTENSITY; break;
-      case 1: r0=g0=b0=WHITE_INTENSITY; break;
-      case 2: r1=TERRACOTTA_RED; g1=TERRACOTTA_GREEN; b1=TERRACOTTA_BLUE; break;
-      default:r0=TERRACOTTA_RED; g0=TERRACOTTA_GREEN; b0=TERRACOTTA_BLUE; break;
+      case 0:
+        r1 = g1 = b1 = WHITE_INTENSITY;
+        break;
+
+      case 1:
+        r0 = g0 = b0 = WHITE_INTENSITY;
+        break;
+
+      case 2:
+        r1 = TERRACOTTA_RED;
+        g1 = TERRACOTTA_GREEN;
+        b1 = TERRACOTTA_BLUE;
+        break;
+
+      default:
+        r0 = TERRACOTTA_RED;
+        g0 = TERRACOTTA_GREEN;
+        b0 = TERRACOTTA_BLUE;
+        break;
     }
 
-    stripB.setPixelColor(i,
-      lerpU8(r0,r1,f),
-      lerpU8(g0,g1,f),
-      lerpU8(b0,b1,f)
+    stripB.setPixelColor(
+      i,
+      lerpU8(r0, r1, f),
+      lerpU8(g0, g1, f),
+      lerpU8(b0, b1, f)
     );
   }
 
@@ -312,21 +415,29 @@ void setup() {
   lastSpawnWhiteTime = now;
   lastSpawnTerracottaTime = now;
 
-  spawnWhiteBlob(now);
-  spawnTerracottaBlob(now);
+  if (animationEnabled()) {
+    spawnWhiteBlob(now, -WHITE_LENGTH_PIXELS);
+    spawnTerracottaBlob(now, -TERRACOTTA_LENGTH_PIXELS);
+  } else {
+    // Static mode: visible, frozen blobs.
+    spawnWhiteBlob(now, 0);
+    spawnTerracottaBlob(now, LED_COUNT / 2);
+  }
 }
 
 void loop() {
   uint32_t now = millis();
 
-  if (now - lastSpawnWhiteTime >= SECONDS_TO_MS(WHITE_SPAWN_INTERVAL_SECONDS)) {
-    lastSpawnWhiteTime = now;
-    spawnWhiteBlob(now);
-  }
+  if (animationEnabled()) {
+    if (now - lastSpawnWhiteTime >= scaledSecondsToMs(WHITE_SPAWN_INTERVAL_SECONDS_BASE)) {
+      lastSpawnWhiteTime = now;
+      spawnWhiteBlob(now, -WHITE_LENGTH_PIXELS);
+    }
 
-  if (now - lastSpawnTerracottaTime >= SECONDS_TO_MS(TERRACOTTA_SPAWN_INTERVAL_SECONDS)) {
-    lastSpawnTerracottaTime = now;
-    spawnTerracottaBlob(now);
+    if (now - lastSpawnTerracottaTime >= scaledSecondsToMs(TERRACOTTA_SPAWN_INTERVAL_SECONDS_BASE)) {
+      lastSpawnTerracottaTime = now;
+      spawnTerracottaBlob(now, -TERRACOTTA_LENGTH_PIXELS);
+    }
   }
 
   updateBlobs(now);
