@@ -2,11 +2,16 @@
 // RGB strips only. No RGBW.
 // Strip A: smooth sub-pixel blobs.
 // Strip B: travelling palette/white gradient.
+// Palette advances on each startup using EEPROM:
+// Terracotta -> Forest -> Ocean -> Rainbow -> repeat.
 
 #include <Adafruit_NeoPixel.h>
+#include <EEPROM.h>
+
 #ifdef __AVR__
  #include <avr/pgmspace.h>
 #endif
+
 #include <math.h>
 
 // ===================== STRIP A =====================
@@ -16,8 +21,8 @@
 
 #define WHITE_LEN          30
 #define WHITE_STEP_MS      50
-#define WHITE_LEVEL        120
-#define WHITE_SPAWN_MS     4000
+#define WHITE_LEVEL        128
+#define WHITE_SPAWN_MS     4500
 
 #define COLOR_LEN          35
 #define COLOR_STEP_MS      50
@@ -27,6 +32,7 @@
 #define FEATHER_LEN        5
 #define ARRIVE_FADE_MS     350
 
+// 1 LED = 256 sub-steps
 #define FP_SHIFT 8
 #define FP       256L
 
@@ -40,7 +46,7 @@ Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 Adafruit_NeoPixel stripB(LED_COUNT_B, LED_PIN_B, NEO_GRB + NEO_KHZ800);
 
-// ===================== PALETTES IN FLASH =====================
+// ===================== PALETTES =====================
 #define PAL_TERRACOTTA 0
 #define PAL_FOREST     1
 #define PAL_OCEAN      2
@@ -48,35 +54,51 @@ Adafruit_NeoPixel stripB(LED_COUNT_B, LED_PIN_B, NEO_GRB + NEO_KHZ800);
 #define PAL_COUNT      4
 #define PAL_COLORS     4
 
+#define EEPROM_PALETTE_ADDR 0
+
 const uint8_t palettes[PAL_COUNT][PAL_COLORS][3] PROGMEM = {
   { // Terracotta
-    {210, 90, 60},
-    {170, 55, 32},
-    {230,115, 65},
-    {130, 38, 25}
+    {210,  90,  60},
+    {170,  55,  32},
+    {230, 115,  65},
+    {130,  38,  25}
   },
-  { // Forest
+  { // Forest - greener
     {  8, 120,  35},
     { 20, 180,  55},
     { 45, 220,  85},
     {  4,  75,  28}
-
   },
   { // Ocean
-    {  0, 80,150},
-    {  0,150,190},
-    { 25, 60,210},
-    {  0, 35, 90}
+    {  0,  80, 150},
+    {  0, 150, 190},
+    { 25,  60, 210},
+    {  0,  35,  90}
   },
   { // Rainbow
-    {255, 40, 20},
-    {255,160,  0},
-    { 30,190, 70},
-    { 40, 80,255}
+    {255,  40,  20},
+    {255, 160,   0},
+    { 30, 190,  70},
+    { 40,  80, 255}
   }
 };
 
 uint8_t currentPalette = PAL_TERRACOTTA;
+
+uint8_t getNextPalette() {
+  uint8_t last = EEPROM.read(EEPROM_PALETTE_ADDR);
+
+  // First use / garbage value protection
+  if (last >= PAL_COUNT) {
+    last = PAL_COUNT - 1;
+  }
+
+  uint8_t next = last + 1;
+  if (next >= PAL_COUNT) next = 0;
+
+  EEPROM.update(EEPROM_PALETTE_ADDR, next);
+  return next;
+}
 
 void getPaletteColor(uint8_t palette, uint8_t index, uint8_t &r, uint8_t &g, uint8_t &b) {
   palette %= PAL_COUNT;
@@ -316,11 +338,10 @@ uint32_t lastSpawnWhite = 0;
 uint32_t lastSpawnColor = 0;
 
 void setup() {
+  currentPalette = getNextPalette();
 
-  Serial.begin(115200);
+  // Still seed random for colour selection within the active palette.
   randomSeed(analogRead(A5) ^ micros());
-  currentPalette = random(0, PAL_COUNT);
-  Serial.println(currentPalette);
 
   strip.begin();
   strip.setBrightness(BRIGHTNESS);
