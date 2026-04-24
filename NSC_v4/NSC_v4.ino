@@ -1,5 +1,6 @@
-// Strip A: spawn new blobs at input (pixel 0) regularly, arrive smoothly (spawn off-strip + fade-in)
-// Strip B: unchanged travelling gradient on 15px RGB strip.
+// Strip A: smooth sub-pixel blobs entering from pixel 0
+// Strip B: travelling gradient on 20px RGB strip.
+// RGB strips only. No RGBW / W channel.
 
 #include <Adafruit_NeoPixel.h>
 #ifdef __AVR__
@@ -13,14 +14,14 @@
 #define BRIGHTNESS  200
 
 #define WHITE_LEN          30
-#define WHITE_STEP_MS      5
-#define WHITE_LEVEL        255
-#define WHITE_SPAWN_MS     700
+#define WHITE_STEP_MS      70
+#define WHITE_LEVEL        128
+#define WHITE_SPAWN_MS     4500
 
 #define TERRA_LEN          35
-#define TERRA_STEP_MS      10
+#define TERRA_STEP_MS      100
 #define TERRA_LEVEL        255
-#define TERRA_SPAWN_MS     900
+#define TERRA_SPAWN_MS     2000
 
 #define TERRA_R            210
 #define TERRA_G            90
@@ -29,13 +30,18 @@
 #define FEATHER_LEN        5
 #define ARRIVE_FADE_MS     350
 
+// Fixed-point precision.
+// 1 LED = 256 sub-steps.
+// This removes the low-speed LED-to-LED stepping.
+#define FP 256L
+
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ===================== STRIP B =====================
 #define LED_PIN_B        A0
 #define LED_COUNT_B      20
 #define BRIGHTNESS_B     255
-#define TRAVEL_PERIOD_MS 1200
+#define TRAVEL_PERIOD_MS 4000
 #define BLOB_WIDTH       2.2f
 
 Adafruit_NeoPixel stripB(LED_COUNT_B, LED_PIN_B, NEO_GRB + NEO_KHZ800);
@@ -67,38 +73,43 @@ void clearAccumulatorsA() {
   }
 }
 
-// Feather intensity 0..255 for pixel i in a feathered block of length len
-static inline uint8_t featherIntensity(int i, int len, int feather) {
+// Fixed-point feather intensity.
+// local is in FP units from start of blob.
+// len and feather are in LEDs.
+static inline uint8_t featherIntensityFP(long local, int len, int feather) {
   if (len <= 1) return 255;
 
   if (feather < 0) feather = 0;
   if (feather * 2 > len) feather = len / 2;
-
-  int flatLen = len - 2 * feather;
   if (feather == 0) return 255;
 
-  if (i < feather) {
-    return (uint8_t)((uint32_t)255 * (uint32_t)(i + 1) / (uint32_t)feather);
+  long lenFP = (long)len * FP;
+  long featherFP = (long)feather * FP;
+
+  if (local < 0 || local >= lenFP) return 0;
+
+  if (local < featherFP) {
+    return (uint8_t)((local * 255L) / featherFP);
   }
 
-  if (i >= feather + flatLen) {
-    int t = len - i;
-    return (uint8_t)((uint32_t)255 * (uint32_t)t / (uint32_t)feather);
+  if (local >= lenFP - featherFP) {
+    long t = lenFP - local;
+    return (uint8_t)((t * 255L) / featherFP);
   }
 
   return 255;
 }
 
-// -------- Spawned blob system (Strip A) --------
+// -------- Spawned blob system: Strip A --------
 struct Blob {
   bool active;
-  int pos;
+  long pos;              // fixed-point start position: LED index * FP
   int len;
   int feather;
   bool isWhite;
   uint8_t level;
   uint8_t r, g, b;
-  uint32_t stepMs;
+  uint32_t stepMs;       // time to move 1 whole LED
   uint32_t lastStepMs;
   uint32_t spawnMs;
 };
@@ -119,7 +130,7 @@ void spawnWhiteBlob(uint32_t now) {
 
   blobs[idx].active = true;
   blobs[idx].len = WHITE_LEN;
-  blobs[idx].pos = -blobs[idx].len;
+  blobs[idx].pos = -(long)WHITE_LEN * FP;
   blobs[idx].feather = FEATHER_LEN;
   blobs[idx].isWhite = true;
   blobs[idx].level = WHITE_LEVEL;
@@ -137,7 +148,7 @@ void spawnTerraBlob(uint32_t now) {
 
   blobs[idx].active = true;
   blobs[idx].len = TERRA_LEN;
-  blobs[idx].pos = -blobs[idx].len;
+  blobs[idx].pos = -(long)TERRA_LEN * FP;
   blobs[idx].feather = FEATHER_LEN;
   blobs[idx].isWhite = false;
   blobs[idx].level = TERRA_LEVEL;
@@ -153,13 +164,19 @@ void updateBlobs(uint32_t now) {
   for (int i = 0; i < MAX_BLOBS; i++) {
     if (!blobs[i].active) continue;
 
-    if ((uint32_t)(now - blobs[i].lastStepMs) >= blobs[i].stepMs) {
-      blobs[i].lastStepMs = now;
-      blobs[i].pos++;
+    uint32_t elapsed = now - blobs[i].lastStepMs;
+    if (elapsed == 0) continue;
 
-      if (blobs[i].pos >= LED_COUNT) {
-        blobs[i].active = false;
-      }
+    blobs[i].lastStepMs = now;
+
+    // Same speed meaning as before:
+    // stepMs = milliseconds to move 1 LED.
+    // Now movement is sub-pixel smooth.
+    blobs[i].pos += ((long)elapsed * FP) / blobs[i].stepMs;
+
+    // Kill once the whole blob start has passed the strip end.
+    if (blobs[i].pos >= (long)LED_COUNT * FP) {
+      blobs[i].active = false;
     }
   }
 }
@@ -173,15 +190,23 @@ void renderBlobsToAccumulators(uint32_t now) {
     if (len < 1) continue;
     if (len > LED_COUNT) len = LED_COUNT;
 
-    uint32_t age = (uint32_t)(now - b.spawnMs);
-    uint8_t arriveK = (ARRIVE_FADE_MS == 0) ? 255
-                    : (age >= ARRIVE_FADE_MS ? 255 : (uint8_t)((age * 255UL) / (uint32_t)ARRIVE_FADE_MS));
+    uint32_t age = now - b.spawnMs;
+    uint8_t arriveK = (ARRIVE_FADE_MS == 0) ? 255 :
+      (age >= ARRIVE_FADE_MS ? 255 : (uint8_t)((age * 255UL) / ARRIVE_FADE_MS));
 
-    for (int i = 0; i < len; i++) {
-      int x = b.pos + i;
-      if (x < 0 || x >= LED_COUNT) continue;
+    int startX = b.pos / FP;
+    int endX = (b.pos + ((long)len * FP)) / FP + 1;
 
-      uint8_t kFeather = featherIntensity(i, len, b.feather);
+    if (startX < 0) startX = 0;
+    if (endX > LED_COUNT) endX = LED_COUNT;
+
+    for (int x = startX; x < endX; x++) {
+      long pixelPos = (long)x * FP;
+      long local = pixelPos - b.pos;
+
+      uint8_t kFeather = featherIntensityFP(local, len, b.feather);
+      if (kFeather == 0) continue;
+
       uint8_t k = scaleU8(kFeather, arriveK);
       uint8_t a = scaleU8(b.level, k);
 
@@ -204,13 +229,6 @@ void pushToStripA() {
 }
 
 // -------- Strip B travelling gradient --------
-static inline float bump(float dist, float width) {
-  if (width <= 0.0001f) return (dist < 0.5f) ? 1.0f : 0.0f;
-  float x = dist / width;
-  if (x >= 1.0f) return 0.0f;
-  return 0.5f + 0.5f * cosf(x * 3.1415926f);
-}
-
 void updateStripB_Travel(uint32_t now) {
   float t = (float)(now % TRAVEL_PERIOD_MS) / (float)TRAVEL_PERIOD_MS;
   const float cyclesAcrossStrip = 1.0f;
@@ -277,7 +295,9 @@ void setup() {
   stripB.setBrightness(BRIGHTNESS_B);
   stripB.show();
 
-  for (int i = 0; i < MAX_BLOBS; i++) blobs[i].active = false;
+  for (int i = 0; i < MAX_BLOBS; i++) {
+    blobs[i].active = false;
+  }
 
   uint32_t now = millis();
   lastSpawnWhite = now;
