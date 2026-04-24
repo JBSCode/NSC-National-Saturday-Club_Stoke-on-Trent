@@ -1,10 +1,11 @@
-// Strip A: smooth sub-pixel blobs entering from pixel 0
-// Strip B: travelling gradient on 20px RGB strip.
-// RGB strips only. No RGBW / W channel.
+// Memory-optimised UNO version.
+// RGB strips only. No RGBW.
+// Strip A: smooth sub-pixel blobs.
+// Strip B: travelling palette/white gradient.
 
 #include <Adafruit_NeoPixel.h>
 #ifdef __AVR__
- #include <avr/power.h>
+ #include <avr/pgmspace.h>
 #endif
 #include <math.h>
 
@@ -14,26 +15,20 @@
 #define BRIGHTNESS  200
 
 #define WHITE_LEN          30
-#define WHITE_STEP_MS      70
-#define WHITE_LEVEL        128
-#define WHITE_SPAWN_MS     4500
+#define WHITE_STEP_MS      50
+#define WHITE_LEVEL        120
+#define WHITE_SPAWN_MS     4000
 
-#define TERRA_LEN          35
-#define TERRA_STEP_MS      100
-#define TERRA_LEVEL        255
-#define TERRA_SPAWN_MS     2000
-
-#define TERRA_R            210
-#define TERRA_G            90
-#define TERRA_B            60
+#define COLOR_LEN          35
+#define COLOR_STEP_MS      50
+#define COLOR_LEVEL        255
+#define COLOR_SPAWN_MS     2000
 
 #define FEATHER_LEN        5
 #define ARRIVE_FADE_MS     350
 
-// Fixed-point precision.
-// 1 LED = 256 sub-steps.
-// This removes the low-speed LED-to-LED stepping.
-#define FP 256L
+#define FP_SHIFT 8
+#define FP       256L
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -42,23 +37,64 @@ Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 #define LED_COUNT_B      20
 #define BRIGHTNESS_B     255
 #define TRAVEL_PERIOD_MS 4000
-#define BLOB_WIDTH       2.2f
 
 Adafruit_NeoPixel stripB(LED_COUNT_B, LED_PIN_B, NEO_GRB + NEO_KHZ800);
 
-// -------- Accumulators for strip A --------
-uint8_t accR[LED_COUNT];
-uint8_t accG[LED_COUNT];
-uint8_t accB[LED_COUNT];
+// ===================== PALETTES IN FLASH =====================
+#define PAL_TERRACOTTA 0
+#define PAL_FOREST     1
+#define PAL_OCEAN      2
+#define PAL_RAINBOW    3
+#define PAL_COUNT      4
+#define PAL_COLORS     4
 
-// -------- Helpers --------
+const uint8_t palettes[PAL_COUNT][PAL_COLORS][3] PROGMEM = {
+  { // Terracotta
+    {210, 90, 60},
+    {170, 55, 32},
+    {230,115, 65},
+    {130, 38, 25}
+  },
+  { // Forest
+    {  8, 120,  35},
+    { 20, 180,  55},
+    { 45, 220,  85},
+    {  4,  75,  28}
+
+  },
+  { // Ocean
+    {  0, 80,150},
+    {  0,150,190},
+    { 25, 60,210},
+    {  0, 35, 90}
+  },
+  { // Rainbow
+    {255, 40, 20},
+    {255,160,  0},
+    { 30,190, 70},
+    { 40, 80,255}
+  }
+};
+
+uint8_t currentPalette = PAL_TERRACOTTA;
+
+void getPaletteColor(uint8_t palette, uint8_t index, uint8_t &r, uint8_t &g, uint8_t &b) {
+  palette %= PAL_COUNT;
+  index &= 3;
+
+  r = pgm_read_byte(&palettes[palette][index][0]);
+  g = pgm_read_byte(&palettes[palette][index][1]);
+  b = pgm_read_byte(&palettes[palette][index][2]);
+}
+
+// ===================== HELPERS =====================
 static inline uint8_t addClampU8(uint8_t a, uint8_t b) {
-  uint16_t s = (uint16_t)a + (uint16_t)b;
+  uint16_t s = (uint16_t)a + b;
   return (s > 255) ? 255 : (uint8_t)s;
 }
 
 static inline uint8_t scaleU8(uint8_t v, uint8_t scale) {
-  return (uint8_t)(((uint16_t)v * (uint16_t)scale + 127) / 255);
+  return (uint8_t)(((uint16_t)v * scale + 127) / 255);
 }
 
 static inline uint8_t lerpU8(uint8_t a, uint8_t b, float t) {
@@ -67,24 +103,14 @@ static inline uint8_t lerpU8(uint8_t a, uint8_t b, float t) {
   return (uint8_t)(a + (b - a) * t + 0.5f);
 }
 
-void clearAccumulatorsA() {
-  for (int i = 0; i < LED_COUNT; i++) {
-    accR[i] = accG[i] = accB[i] = 0;
-  }
-}
-
-// Fixed-point feather intensity.
-// local is in FP units from start of blob.
-// len and feather are in LEDs.
-static inline uint8_t featherIntensityFP(long local, int len, int feather) {
+static inline uint8_t featherIntensityFP(int32_t local, uint8_t len, uint8_t feather) {
   if (len <= 1) return 255;
 
-  if (feather < 0) feather = 0;
   if (feather * 2 > len) feather = len / 2;
   if (feather == 0) return 255;
 
-  long lenFP = (long)len * FP;
-  long featherFP = (long)feather * FP;
+  int32_t lenFP = (int32_t)len * FP;
+  int32_t featherFP = (int32_t)feather * FP;
 
   if (local < 0 || local >= lenFP) return 0;
 
@@ -93,158 +119,161 @@ static inline uint8_t featherIntensityFP(long local, int len, int feather) {
   }
 
   if (local >= lenFP - featherFP) {
-    long t = lenFP - local;
+    int32_t t = lenFP - local;
     return (uint8_t)((t * 255L) / featherFP);
   }
 
   return 255;
 }
 
-// -------- Spawned blob system: Strip A --------
+// ===================== BLOBS =====================
+#define MAX_BLOBS 8
+
 struct Blob {
-  bool active;
-  long pos;              // fixed-point start position: LED index * FP
-  int len;
-  int feather;
-  bool isWhite;
+  int32_t pos;        // fixed-point start position, LED * 256
+  uint16_t lastMs;    // low 16 bits of millis
+  uint16_t spawnMs;   // low 16 bits of millis
+  uint8_t len;
+  uint8_t feather;
   uint8_t level;
   uint8_t r, g, b;
-  uint32_t stepMs;       // time to move 1 whole LED
-  uint32_t lastStepMs;
-  uint32_t spawnMs;
+  uint8_t stepMs;
+  uint8_t active;
 };
 
-#define MAX_BLOBS 16
 Blob blobs[MAX_BLOBS];
 
-int allocBlob() {
-  for (int i = 0; i < MAX_BLOBS; i++) {
+static inline uint16_t now16(uint32_t now) {
+  return (uint16_t)now;
+}
+
+int8_t allocBlob() {
+  for (uint8_t i = 0; i < MAX_BLOBS; i++) {
     if (!blobs[i].active) return i;
   }
   return -1;
 }
 
 void spawnWhiteBlob(uint32_t now) {
-  int idx = allocBlob();
+  int8_t idx = allocBlob();
   if (idx < 0) return;
 
-  blobs[idx].active = true;
-  blobs[idx].len = WHITE_LEN;
-  blobs[idx].pos = -(long)WHITE_LEN * FP;
-  blobs[idx].feather = FEATHER_LEN;
-  blobs[idx].isWhite = true;
-  blobs[idx].level = WHITE_LEVEL;
-  blobs[idx].r = WHITE_LEVEL;
-  blobs[idx].g = WHITE_LEVEL;
-  blobs[idx].b = WHITE_LEVEL;
-  blobs[idx].stepMs = WHITE_STEP_MS;
-  blobs[idx].lastStepMs = now;
-  blobs[idx].spawnMs = now;
+  Blob &b = blobs[idx];
+
+  b.active = 1;
+  b.len = WHITE_LEN;
+  b.pos = -((int32_t)WHITE_LEN * FP);
+  b.feather = FEATHER_LEN;
+  b.level = WHITE_LEVEL;
+  b.r = WHITE_LEVEL;
+  b.g = WHITE_LEVEL;
+  b.b = WHITE_LEVEL;
+  b.stepMs = WHITE_STEP_MS;
+  b.lastMs = now16(now);
+  b.spawnMs = now16(now);
 }
 
-void spawnTerraBlob(uint32_t now) {
-  int idx = allocBlob();
+void spawnColorBlob(uint32_t now) {
+  int8_t idx = allocBlob();
   if (idx < 0) return;
 
-  blobs[idx].active = true;
-  blobs[idx].len = TERRA_LEN;
-  blobs[idx].pos = -(long)TERRA_LEN * FP;
-  blobs[idx].feather = FEATHER_LEN;
-  blobs[idx].isWhite = false;
-  blobs[idx].level = TERRA_LEVEL;
-  blobs[idx].r = TERRA_R;
-  blobs[idx].g = TERRA_G;
-  blobs[idx].b = TERRA_B;
-  blobs[idx].stepMs = TERRA_STEP_MS;
-  blobs[idx].lastStepMs = now;
-  blobs[idx].spawnMs = now;
+  Blob &b = blobs[idx];
+
+  uint8_t r, g, bl;
+  getPaletteColor(currentPalette, random(0, 4), r, g, bl);
+
+  b.active = 1;
+  b.len = COLOR_LEN;
+  b.pos = -((int32_t)COLOR_LEN * FP);
+  b.feather = FEATHER_LEN;
+  b.level = COLOR_LEVEL;
+  b.r = r;
+  b.g = g;
+  b.b = bl;
+  b.stepMs = COLOR_STEP_MS;
+  b.lastMs = now16(now);
+  b.spawnMs = now16(now);
 }
 
 void updateBlobs(uint32_t now) {
-  for (int i = 0; i < MAX_BLOBS; i++) {
-    if (!blobs[i].active) continue;
+  uint16_t n = now16(now);
 
-    uint32_t elapsed = now - blobs[i].lastStepMs;
+  for (uint8_t i = 0; i < MAX_BLOBS; i++) {
+    Blob &b = blobs[i];
+    if (!b.active) continue;
+
+    uint16_t elapsed = n - b.lastMs;
     if (elapsed == 0) continue;
 
-    blobs[i].lastStepMs = now;
+    b.lastMs = n;
 
-    // Same speed meaning as before:
-    // stepMs = milliseconds to move 1 LED.
-    // Now movement is sub-pixel smooth.
-    blobs[i].pos += ((long)elapsed * FP) / blobs[i].stepMs;
+    // stepMs = time to move 1 LED
+    b.pos += ((int32_t)elapsed * FP) / b.stepMs;
 
-    // Kill once the whole blob start has passed the strip end.
-    if (blobs[i].pos >= (long)LED_COUNT * FP) {
-      blobs[i].active = false;
+    if (b.pos >= ((int32_t)LED_COUNT * FP)) {
+      b.active = 0;
     }
   }
 }
 
-void renderBlobsToAccumulators(uint32_t now) {
-  for (int bi = 0; bi < MAX_BLOBS; bi++) {
-    if (!blobs[bi].active) continue;
-    Blob &b = blobs[bi];
+// No RGB accumulator arrays.
+// For each pixel, calculate combined colour directly.
+void renderAndPushStripA(uint32_t now) {
+  uint16_t n = now16(now);
 
-    int len = b.len;
-    if (len < 1) continue;
-    if (len > LED_COUNT) len = LED_COUNT;
+  for (uint16_t x = 0; x < LED_COUNT; x++) {
+    uint8_t outR = 0;
+    uint8_t outG = 0;
+    uint8_t outB = 0;
 
-    uint32_t age = now - b.spawnMs;
-    uint8_t arriveK = (ARRIVE_FADE_MS == 0) ? 255 :
-      (age >= ARRIVE_FADE_MS ? 255 : (uint8_t)((age * 255UL) / ARRIVE_FADE_MS));
+    int32_t pixelPos = (int32_t)x * FP;
 
-    int startX = b.pos / FP;
-    int endX = (b.pos + ((long)len * FP)) / FP + 1;
+    for (uint8_t bi = 0; bi < MAX_BLOBS; bi++) {
+      Blob &b = blobs[bi];
+      if (!b.active) continue;
 
-    if (startX < 0) startX = 0;
-    if (endX > LED_COUNT) endX = LED_COUNT;
-
-    for (int x = startX; x < endX; x++) {
-      long pixelPos = (long)x * FP;
-      long local = pixelPos - b.pos;
-
-      uint8_t kFeather = featherIntensityFP(local, len, b.feather);
+      int32_t local = pixelPos - b.pos;
+      uint8_t kFeather = featherIntensityFP(local, b.len, b.feather);
       if (kFeather == 0) continue;
+
+      uint16_t age = n - b.spawnMs;
+      uint8_t arriveK = (age >= ARRIVE_FADE_MS)
+        ? 255
+        : (uint8_t)(((uint32_t)age * 255UL) / ARRIVE_FADE_MS);
 
       uint8_t k = scaleU8(kFeather, arriveK);
       uint8_t a = scaleU8(b.level, k);
 
-      uint8_t r = scaleU8(b.r, a);
-      uint8_t g = scaleU8(b.g, a);
-      uint8_t bl = scaleU8(b.b, a);
-
-      accR[x] = addClampU8(accR[x], r);
-      accG[x] = addClampU8(accG[x], g);
-      accB[x] = addClampU8(accB[x], bl);
+      outR = addClampU8(outR, scaleU8(b.r, a));
+      outG = addClampU8(outG, scaleU8(b.g, a));
+      outB = addClampU8(outB, scaleU8(b.b, a));
     }
-  }
-}
 
-void pushToStripA() {
-  for (int i = 0; i < LED_COUNT; i++) {
-    strip.setPixelColor(i, strip.Color(accR[i], accG[i], accB[i]));
+    strip.setPixelColor(x, strip.Color(outR, outG, outB));
   }
+
   strip.show();
 }
 
-// -------- Strip B travelling gradient --------
+// ===================== STRIP B =====================
 void updateStripB_Travel(uint32_t now) {
   float t = (float)(now % TRAVEL_PERIOD_MS) / (float)TRAVEL_PERIOD_MS;
   const float cyclesAcrossStrip = 1.0f;
+  uint8_t whiteRGB = WHITE_LEVEL;
 
-  uint8_t whiteRGB = (uint8_t)WHITE_LEVEL;
-
-  for (int i = 0; i < LED_COUNT_B; i++) {
+  for (uint8_t i = 0; i < LED_COUNT_B; i++) {
     float u = t + cyclesAcrossStrip * ((float)i / (float)LED_COUNT_B);
     u = u - floorf(u);
 
     float seg = u * 4.0f;
-    int s = (int)seg;
+    uint8_t s = (uint8_t)seg;
     float f = seg - (float)s;
 
     uint8_t r0 = 0, g0 = 0, b0 = 0;
     uint8_t r1 = 0, g1 = 0, b1 = 0;
+
+    uint8_t pr, pg, pb;
+    getPaletteColor(currentPalette, i & 3, pr, pg, pb);
 
     switch (s) {
       case 0:
@@ -260,33 +289,39 @@ void updateStripB_Travel(uint32_t now) {
         break;
 
       case 2:
-        r1 = TERRA_R;
-        g1 = TERRA_G;
-        b1 = TERRA_B;
+        r1 = pr;
+        g1 = pg;
+        b1 = pb;
         break;
 
       default:
-        r0 = TERRA_R;
-        g0 = TERRA_G;
-        b0 = TERRA_B;
+        r0 = pr;
+        g0 = pg;
+        b0 = pb;
         break;
     }
 
-    uint8_t r = lerpU8(r0, r1, f);
-    uint8_t g = lerpU8(g0, g1, f);
-    uint8_t b = lerpU8(b0, b1, f);
-
-    stripB.setPixelColor(i, r, g, b);
+    stripB.setPixelColor(i,
+      lerpU8(r0, r1, f),
+      lerpU8(g0, g1, f),
+      lerpU8(b0, b1, f)
+    );
   }
 
   stripB.show();
 }
 
-// -------- Spawners --------
+// ===================== MAIN =====================
 uint32_t lastSpawnWhite = 0;
-uint32_t lastSpawnTerra = 0;
+uint32_t lastSpawnColor = 0;
 
 void setup() {
+
+  Serial.begin(115200);
+  randomSeed(analogRead(A5) ^ micros());
+  currentPalette = random(0, PAL_COUNT);
+  Serial.println(currentPalette);
+
   strip.begin();
   strip.setBrightness(BRIGHTNESS);
   strip.show();
@@ -295,16 +330,16 @@ void setup() {
   stripB.setBrightness(BRIGHTNESS_B);
   stripB.show();
 
-  for (int i = 0; i < MAX_BLOBS; i++) {
-    blobs[i].active = false;
+  for (uint8_t i = 0; i < MAX_BLOBS; i++) {
+    blobs[i].active = 0;
   }
 
   uint32_t now = millis();
   lastSpawnWhite = now;
-  lastSpawnTerra = now;
+  lastSpawnColor = now;
 
   spawnWhiteBlob(now);
-  spawnTerraBlob(now);
+  spawnColorBlob(now);
 }
 
 void loop() {
@@ -315,16 +350,12 @@ void loop() {
     spawnWhiteBlob(now);
   }
 
-  if ((uint32_t)(now - lastSpawnTerra) >= TERRA_SPAWN_MS) {
-    lastSpawnTerra = now;
-    spawnTerraBlob(now);
+  if ((uint32_t)(now - lastSpawnColor) >= COLOR_SPAWN_MS) {
+    lastSpawnColor = now;
+    spawnColorBlob(now);
   }
 
   updateBlobs(now);
-
-  clearAccumulatorsA();
-  renderBlobsToAccumulators(now);
-  pushToStripA();
-
+  renderAndPushStripA(now);
   updateStripB_Travel(now);
 }
